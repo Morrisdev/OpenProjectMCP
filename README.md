@@ -43,9 +43,9 @@ Just talk to Claude like you would a teammate. Here are some real examples:
 
 Most AI tools make a fresh API call every time they need basic info like "what projects exist?" or "what's Nathan's user ID?". That gets slow and noisy.
 
-This server keeps a local **cache file** (`dist/cache.json`) on your machine with your projects, users, work package types, statuses, and open features baked in. When Claude needs to look something up, it reads from the cache instantly — no API round-trip needed.
+This server keeps a local **SQLite database** (`dist/cache.db`) on your machine with your projects, users, work package types, statuses, and open features baked in. When Claude needs to look something up, it reads from the cache instantly — no API round-trip needed.
 
-The cache is just a plain JSON file. It lives in `dist/` and is never committed to git (your credentials aren't in it either).
+The database lives in `dist/` and is never committed to git (your credentials aren't in it either).
 
 **Cache tools Claude can use:**
 

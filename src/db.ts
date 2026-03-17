@@ -1,5 +1,5 @@
-import fs from "fs";
 import path from "path";
+import Database from "better-sqlite3";
 import { CACHED_PROJECTS } from "./data/projects.js";
 import { CACHED_USERS } from "./data/users.js";
 import { CACHED_TYPES } from "./data/types.js";
@@ -8,7 +8,7 @@ import { CACHED_FEATURES } from "./data/features.js";
 
 export const DB_PATH =
   process.env.OPENPROJECT_DB_PATH ||
-  path.join(__dirname, "cache.json");
+  path.join(__dirname, "cache.db");
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -28,163 +28,196 @@ interface Feature {
   id: number; subject: string; projectId: number; project: string; module: string; status: string;
 }
 
-interface CacheStore {
-  projects: Project[];
-  users: User[];
-  types: WpType[];
-  statuses: Status[];
-  features: Feature[];
+// ── DB init ───────────────────────────────────────────────────────────────────
+
+let _db: Database.Database | null = null;
+
+function getDb(): Database.Database {
+  if (_db) return _db;
+  _db = new Database(DB_PATH);
+  _db.pragma("journal_mode = WAL");
+  _db.exec(`
+    CREATE TABLE IF NOT EXISTS projects (
+      id INTEGER PRIMARY KEY,
+      identifier TEXT NOT NULL,
+      name TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      parent TEXT
+    );
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY,
+      login TEXT NOT NULL,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'active'
+    );
+    CREATE TABLE IF NOT EXISTS types (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      isDefault INTEGER NOT NULL DEFAULT 0,
+      isMilestone INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS statuses (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      isClosed INTEGER NOT NULL DEFAULT 0,
+      isDefault INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS features (
+      id INTEGER PRIMARY KEY,
+      subject TEXT NOT NULL,
+      projectId INTEGER NOT NULL,
+      project TEXT NOT NULL,
+      module TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL
+    );
+  `);
+  return _db;
 }
 
-// ── Load / Save ───────────────────────────────────────────────────────────────
+function isEmpty(): boolean {
+  const db = getDb();
+  const row = db.prepare("SELECT COUNT(*) as n FROM projects").get() as { n: number };
+  return row.n === 0;
+}
 
-let _store: CacheStore | null = null;
+function seed(): void {
+  const db = getDb();
+  const insertProject = db.prepare(
+    "INSERT OR REPLACE INTO projects (id, identifier, name, active, parent) VALUES (?, ?, ?, ?, ?)"
+  );
+  const insertUser = db.prepare(
+    "INSERT OR REPLACE INTO users (id, login, name, email, status) VALUES (?, ?, ?, ?, ?)"
+  );
+  const insertType = db.prepare(
+    "INSERT OR REPLACE INTO types (id, name, isDefault, isMilestone) VALUES (?, ?, ?, ?)"
+  );
+  const insertStatus = db.prepare(
+    "INSERT OR REPLACE INTO statuses (id, name, isClosed, isDefault) VALUES (?, ?, ?, ?)"
+  );
+  const insertFeature = db.prepare(
+    "INSERT OR REPLACE INTO features (id, subject, projectId, project, module, status) VALUES (?, ?, ?, ?, ?, ?)"
+  );
 
-function load(): CacheStore {
-  if (_store) return _store;
-  if (fs.existsSync(DB_PATH)) {
-    try {
-      _store = JSON.parse(fs.readFileSync(DB_PATH, "utf8")) as CacheStore;
-      return _store;
-    } catch {
-      // fall through to seed
+  const seedAll = db.transaction(() => {
+    for (const p of CACHED_PROJECTS) {
+      insertProject.run(p.id, p.identifier, p.name, p.active ? 1 : 0, p.parent ?? null);
     }
-  }
-  _store = seed();
-  save(_store);
-  return _store;
-}
-
-function save(store: CacheStore): void {
-  fs.writeFileSync(DB_PATH, JSON.stringify(store, null, 2), "utf8");
-}
-
-function getStore(): CacheStore {
-  return load();
-}
-
-function seed(): CacheStore {
-  return {
-    projects: CACHED_PROJECTS.map((p) => ({ ...p, parent: p.parent ?? null })),
-    users: CACHED_USERS as User[],
-    types: CACHED_TYPES as WpType[],
-    statuses: CACHED_STATUSES as Status[],
-    features: CACHED_FEATURES as Feature[],
-  };
+    for (const u of CACHED_USERS) {
+      insertUser.run(u.id, u.login, u.name, (u as any).email ?? "", u.status);
+    }
+    for (const t of CACHED_TYPES) {
+      insertType.run(t.id, t.name, t.isDefault ? 1 : 0, t.isMilestone ? 1 : 0);
+    }
+    for (const s of CACHED_STATUSES) {
+      insertStatus.run(s.id, s.name, s.isClosed ? 1 : 0, s.isDefault ? 1 : 0);
+    }
+    for (const f of CACHED_FEATURES) {
+      insertFeature.run(f.id, f.subject, f.projectId, f.project, f.module, f.status);
+    }
+  });
+  seedAll();
 }
 
 // ── Projects ──────────────────────────────────────────────────────────────────
 
 export function dbListProjects(activeOnly = false): Project[] {
-  const store = getStore();
-  return activeOnly ? store.projects.filter((p) => p.active) : store.projects;
+  const db = getDb();
+  const rows = activeOnly
+    ? db.prepare("SELECT * FROM projects WHERE active = 1 ORDER BY name").all()
+    : db.prepare("SELECT * FROM projects ORDER BY name").all();
+  return (rows as any[]).map((r) => ({ ...r, active: r.active === 1 }));
 }
 
 export function dbUpsertProject(id: number, identifier: string, name: string, active: boolean, parent: string | null): void {
-  const store = getStore();
-  const idx = store.projects.findIndex((p) => p.id === id);
-  const record: Project = { id, identifier, name, active, parent };
-  if (idx >= 0) store.projects[idx] = record;
-  else store.projects.push(record);
-  save(store);
+  getDb().prepare(
+    "INSERT OR REPLACE INTO projects (id, identifier, name, active, parent) VALUES (?, ?, ?, ?, ?)"
+  ).run(id, identifier, name, active ? 1 : 0, parent);
 }
 
 export function dbDeleteProject(id: number): void {
-  const store = getStore();
-  store.projects = store.projects.filter((p) => p.id !== id);
-  save(store);
+  getDb().prepare("DELETE FROM projects WHERE id = ?").run(id);
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────
 
 export function dbListUsers(activeOnly = false): User[] {
-  const store = getStore();
-  return activeOnly ? store.users.filter((u) => u.status === "active") : store.users;
+  const db = getDb();
+  const rows = activeOnly
+    ? db.prepare("SELECT * FROM users WHERE status = 'active' ORDER BY name").all()
+    : db.prepare("SELECT * FROM users ORDER BY name").all();
+  return rows as User[];
 }
 
 export function dbUpsertUser(id: number, login: string, name: string, email: string, status: string): void {
-  const store = getStore();
-  const idx = store.users.findIndex((u) => u.id === id);
-  const record: User = { id, login, name, email, status };
-  if (idx >= 0) store.users[idx] = record;
-  else store.users.push(record);
-  save(store);
+  getDb().prepare(
+    "INSERT OR REPLACE INTO users (id, login, name, email, status) VALUES (?, ?, ?, ?, ?)"
+  ).run(id, login, name, email, status);
 }
 
 export function dbDeleteUser(id: number): void {
-  const store = getStore();
-  store.users = store.users.filter((u) => u.id !== id);
-  save(store);
+  getDb().prepare("DELETE FROM users WHERE id = ?").run(id);
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export function dbListTypes(): WpType[] {
-  return getStore().types;
+  const rows = getDb().prepare("SELECT * FROM types ORDER BY name").all();
+  return (rows as any[]).map((r) => ({ ...r, isDefault: r.isDefault === 1, isMilestone: r.isMilestone === 1 }));
 }
 
 export function dbUpsertType(id: number, name: string, isDefault: boolean, isMilestone: boolean): void {
-  const store = getStore();
-  const idx = store.types.findIndex((t) => t.id === id);
-  const record: WpType = { id, name, isDefault, isMilestone };
-  if (idx >= 0) store.types[idx] = record;
-  else store.types.push(record);
-  save(store);
+  getDb().prepare(
+    "INSERT OR REPLACE INTO types (id, name, isDefault, isMilestone) VALUES (?, ?, ?, ?)"
+  ).run(id, name, isDefault ? 1 : 0, isMilestone ? 1 : 0);
 }
 
 export function dbDeleteType(id: number): void {
-  const store = getStore();
-  store.types = store.types.filter((t) => t.id !== id);
-  save(store);
+  getDb().prepare("DELETE FROM types WHERE id = ?").run(id);
 }
 
 // ── Statuses ──────────────────────────────────────────────────────────────────
 
 export function dbListStatuses(): Status[] {
-  return getStore().statuses;
+  const rows = getDb().prepare("SELECT * FROM statuses ORDER BY name").all();
+  return (rows as any[]).map((r) => ({ ...r, isClosed: r.isClosed === 1, isDefault: r.isDefault === 1 }));
 }
 
 export function dbUpsertStatus(id: number, name: string, isClosed: boolean, isDefault: boolean): void {
-  const store = getStore();
-  const idx = store.statuses.findIndex((s) => s.id === id);
-  const record: Status = { id, name, isClosed, isDefault };
-  if (idx >= 0) store.statuses[idx] = record;
-  else store.statuses.push(record);
-  save(store);
+  getDb().prepare(
+    "INSERT OR REPLACE INTO statuses (id, name, isClosed, isDefault) VALUES (?, ?, ?, ?)"
+  ).run(id, name, isClosed ? 1 : 0, isDefault ? 1 : 0);
 }
 
 export function dbDeleteStatus(id: number): void {
-  const store = getStore();
-  store.statuses = store.statuses.filter((s) => s.id !== id);
-  save(store);
+  getDb().prepare("DELETE FROM statuses WHERE id = ?").run(id);
 }
 
 // ── Features ──────────────────────────────────────────────────────────────────
 
 export function dbListFeatures(projectId?: number): Feature[] {
-  const store = getStore();
-  return projectId ? store.features.filter((f) => f.projectId === projectId) : store.features;
+  const db = getDb();
+  const rows = projectId
+    ? db.prepare("SELECT * FROM features WHERE projectId = ? ORDER BY subject").all(projectId)
+    : db.prepare("SELECT * FROM features ORDER BY subject").all();
+  return rows as Feature[];
 }
 
 export function dbUpsertFeature(id: number, subject: string, projectId: number, project: string, module: string, status: string): void {
-  const store = getStore();
-  const idx = store.features.findIndex((f) => f.id === id);
-  const record: Feature = { id, subject, projectId, project, module, status };
-  if (idx >= 0) store.features[idx] = record;
-  else store.features.push(record);
-  save(store);
+  getDb().prepare(
+    "INSERT OR REPLACE INTO features (id, subject, projectId, project, module, status) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run(id, subject, projectId, project, module, status);
 }
 
 export function dbDeleteFeature(id: number): void {
-  const store = getStore();
-  store.features = store.features.filter((f) => f.id !== id);
-  save(store);
+  getDb().prepare("DELETE FROM features WHERE id = ?").run(id);
 }
 
 // ── Init (used by postbuild script) ──────────────────────────────────────────
 
 export function initCache(): string {
-  load(); // creates cache.json from seed data if it doesn't exist
+  getDb(); // ensures tables exist
+  if (isEmpty()) seed();
   return DB_PATH;
 }
 
@@ -201,69 +234,101 @@ export async function rebuildCache(baseUrl: string, apiKey: string): Promise<str
   };
 
   const log: string[] = [];
+  const db = getDb();
+
+  // Clear all tables
+  db.exec("DELETE FROM projects; DELETE FROM users; DELETE FROM types; DELETE FROM statuses; DELETE FROM features;");
 
   // Projects
   const projData = await get("/projects?pageSize=200");
-  const projects: Project[] = (projData._embedded.elements as {
+  const insertProject = db.prepare(
+    "INSERT OR REPLACE INTO projects (id, identifier, name, active, parent) VALUES (?, ?, ?, ?, ?)"
+  );
+  const projects = projData._embedded.elements as {
     id: number; identifier: string; name: string; active: boolean;
     _links: { parent: { title: string | null } };
-  }[]).map((p) => ({
-    id: p.id,
-    identifier: p.identifier,
-    name: p.name,
-    active: p.active,
-    parent: p._links.parent?.title ?? null,
-  }));
+  }[];
+  const seedProjects = db.transaction(() => {
+    for (const p of projects) {
+      insertProject.run(p.id, p.identifier, p.name, p.active ? 1 : 0, p._links.parent?.title ?? null);
+    }
+  });
+  seedProjects();
   log.push(`Projects: ${projects.length} loaded`);
 
   // Users
   const userData = await get("/users?pageSize=200");
-  const users: User[] = (userData._embedded.elements as {
+  const insertUser = db.prepare(
+    "INSERT OR REPLACE INTO users (id, login, name, email, status) VALUES (?, ?, ?, ?, ?)"
+  );
+  const users = userData._embedded.elements as {
     id: number; login: string; firstName: string; lastName: string; email: string; status: string;
-  }[]).map((u) => ({
-    id: u.id,
-    login: u.login,
-    name: `${u.firstName} ${u.lastName}`.trim(),
-    email: u.email ?? "",
-    status: u.status,
-  }));
+  }[];
+  const seedUsers = db.transaction(() => {
+    for (const u of users) {
+      insertUser.run(u.id, u.login, `${u.firstName} ${u.lastName}`.trim(), u.email ?? "", u.status);
+    }
+  });
+  seedUsers();
   log.push(`Users: ${users.length} loaded`);
 
   // Types
   const typeData = await get("/types?pageSize=100");
-  const types: WpType[] = (typeData._embedded.elements as {
+  const insertType = db.prepare(
+    "INSERT OR REPLACE INTO types (id, name, isDefault, isMilestone) VALUES (?, ?, ?, ?)"
+  );
+  const types = typeData._embedded.elements as {
     id: number; name: string; isDefault: boolean; isMilestone: boolean;
-  }[]).map((t) => ({ id: t.id, name: t.name, isDefault: t.isDefault, isMilestone: t.isMilestone }));
+  }[];
+  const seedTypes = db.transaction(() => {
+    for (const t of types) {
+      insertType.run(t.id, t.name, t.isDefault ? 1 : 0, t.isMilestone ? 1 : 0);
+    }
+  });
+  seedTypes();
   log.push(`Types: ${types.length} loaded`);
 
   // Statuses
   const statusData = await get("/statuses");
-  const statuses: Status[] = (statusData._embedded.elements as {
+  const insertStatus = db.prepare(
+    "INSERT OR REPLACE INTO statuses (id, name, isClosed, isDefault) VALUES (?, ?, ?, ?)"
+  );
+  const statuses = statusData._embedded.elements as {
     id: number; name: string; isClosed: boolean; isDefault: boolean;
-  }[]).map((s) => ({ id: s.id, name: s.name, isClosed: s.isClosed, isDefault: s.isDefault }));
+  }[];
+  const seedStatuses = db.transaction(() => {
+    for (const s of statuses) {
+      insertStatus.run(s.id, s.name, s.isClosed ? 1 : 0, s.isDefault ? 1 : 0);
+    }
+  });
+  seedStatuses();
   log.push(`Statuses: ${statuses.length} loaded`);
 
-  // Open Features (type=4, status=open)
+  // Open Features
   const featureFilters = encodeURIComponent(
     JSON.stringify([{ type: { operator: "=", values: ["4"] } }, { status: { operator: "o" } }])
   );
   const featData = await get(`/work_packages?filters=${featureFilters}&pageSize=500`);
-  const features: Feature[] = (featData._embedded.elements as {
+  const insertFeature = db.prepare(
+    "INSERT OR REPLACE INTO features (id, subject, projectId, project, module, status) VALUES (?, ?, ?, ?, ?, ?)"
+  );
+  const features = featData._embedded.elements as {
     id: number; subject: string; customField1: string | null;
     _links: { project: { href: string; title: string }; status: { title: string } };
-  }[]).map((f) => ({
-    id: f.id,
-    subject: f.subject,
-    projectId: parseInt(f._links.project.href.split("/").pop()!, 10),
-    project: f._links.project.title,
-    module: f.customField1 ?? "",
-    status: f._links.status.title,
-  }));
+  }[];
+  const seedFeatures = db.transaction(() => {
+    for (const f of features) {
+      insertFeature.run(
+        f.id, f.subject,
+        parseInt(f._links.project.href.split("/").pop()!, 10),
+        f._links.project.title,
+        f.customField1 ?? "",
+        f._links.status.title
+      );
+    }
+  });
+  seedFeatures();
   log.push(`Features: ${features.length} loaded`);
-
-  const store: CacheStore = { projects, users, types, statuses, features };
-  _store = store;
-  save(store);
 
   return log;
 }
