@@ -63,7 +63,8 @@ The database lives in `dist/` and is never committed to git (your credentials ar
 | `cache_upsert_status` / `cache_delete_status` | Add, update, or remove a status |
 | `cache_upsert_feature` / `cache_delete_feature` | Add, update, or remove a feature |
 
-**The features cache is special:** when you create a work package and pick a Feature as the parent, Claude will automatically set the `Module` field to match that feature. This keeps your module assignments consistent without you having to remember them.
+**The features cache is special:** 
+if you have a custom field called "Module" (which we use to track various features which may be related yet aren't part of the same parent) and you set that Module field value in the feature, Claude will automatically set the `Module` field of the new work package to match that feature. This keeps your module assignments consistent without you having to remember them.
 
 ---
 
